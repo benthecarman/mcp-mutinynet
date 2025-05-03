@@ -12,21 +12,41 @@ pub fn register_tools(router_builder: RouterBuilder) -> RouterBuilder {
     router_builder
         .append_dyn("tools/list", tools_list.into_dyn())
         .append_dyn("login", login.into_dyn())
+        .append_dyn("pay_mutinynet_invoice", pay_mutinynet_invoice.into_dyn())
 }
 
 pub async fn tools_list(_request: Option<ListToolsRequest>) -> HandlerResult<ListToolsResult> {
+    let login = Tool {
+        name: "login".to_string(),
+        description: Some(
+            "Authorizes the user so they can use the functionality of the mutinynet MCP server."
+                .to_string(),
+        ),
+        input_schema: ToolInputSchema {
+            type_name: "object".to_string(),
+            properties: hashmap! {},
+            required: vec![],
+        },
+    };
+    let pay_mutinynet_invoice = Tool {
+        name: "pay_mutinynet_invoice".to_string(),
+        description: Some("Pays the given mutinynet invoice".to_string()),
+        input_schema: ToolInputSchema {
+            type_name: "object".to_string(),
+            properties: hashmap! {
+                "invoice".to_string() => ToolInputSchemaProperty {
+                    type_name: Some("string".to_owned()),
+                    description: Some("Mutinynet invoice to pay".to_owned()),
+                    enum_values: None,
+                }
+            },
+            required: vec!["invoice".to_string()],
+        },
+    };
     let response = ListToolsResult {
-		tools: vec![Tool {
-			name: "login".to_string(),
-			description: Some("Authorizes the user so they can use the functionality of the mutinynet MCP server.".to_string()),
-			input_schema: ToolInputSchema {
-				type_name: "object".to_string(),
-				properties: hashmap! { },
-				required: vec![],
-			},
-		}],
-		next_cursor: None,
-	};
+        tools: vec![login, pay_mutinynet_invoice],
+        next_cursor: None,
+    };
     Ok(response)
 }
 
@@ -48,6 +68,11 @@ struct DeviceLoginResponse {
 #[derive(Deserialize)]
 struct AccessTokenResponse {
     access_token: String,
+}
+
+#[derive(Deserialize)]
+struct DeviceReturn {
+    token: String,
 }
 
 pub async fn login(_: LoginRequest) -> HandlerResult<CallToolResult> {
@@ -91,8 +116,20 @@ pub async fn login(_: LoginRequest) -> HandlerResult<CallToolResult> {
                 .await
             {
                 if let Ok(res) = res.json::<AccessTokenResponse>().await {
-                    utilities::write_bearer_token(res.access_token);
-                    return;
+                    if let Ok(res) = client
+                        .post("https://faucet.mutinynet.com/auth/github/device")
+                        .json(&json!({
+                            "code": res.access_token,
+                        }))
+                        .header("Content-Type", "application/json")
+                        .send()
+                        .await
+                    {
+                        if let Ok(device) = res.json::<DeviceReturn>().await {
+                            utilities::write_bearer_token(device.token);
+                            return;
+                        }
+                    }
                 }
             }
 
@@ -100,6 +137,67 @@ pub async fn login(_: LoginRequest) -> HandlerResult<CallToolResult> {
         }
     });
 
+    Ok(CallToolResult {
+        is_error: false,
+        content: vec![CallToolResultContent::Text { text }],
+    })
+}
+
+#[derive(Deserialize, Serialize, RpcParams)]
+pub struct PayInvoiceRequest {
+    invoice: String,
+}
+
+#[derive(Deserialize)]
+pub struct LightningResponse {
+    pub payment_hash: String,
+}
+
+pub async fn pay_mutinynet_invoice(req: PayInvoiceRequest) -> HandlerResult<CallToolResult> {
+    let token = match utilities::get_bearer_token() {
+        Some(token) => token,
+        None => {
+            return Ok(CallToolResult {
+                is_error: true,
+                content: vec![CallToolResultContent::Text {
+                    text: "You need to login first!".to_string(),
+                }],
+            });
+        }
+    };
+
+    let client = Client::new();
+
+    let resp = client
+        .post("https://faucet.mutinynet.com/api/lightning")
+        .json(&json!({
+            "bolt11": req.invoice,
+        }))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|_| {
+            json!({"code": -32603, "message": "Error making request"}).into_handler_error()
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.map_err(|_| {
+            json!({"code": -32603, "message": "Error decoding text"}).into_handler_error()
+        })?;
+
+        return Err(
+            json!({"code": -32603, "message": format!("Error ({status}): {text}")})
+                .into_handler_error(),
+        );
+    }
+
+    let res: LightningResponse = resp.json().await.map_err(|_| {
+        json!({"code": -32603, "message": "Error decoding response"}).into_handler_error()
+    })?;
+
+    let text = format!("Payment success! Preimage: {}", res.payment_hash);
     Ok(CallToolResult {
         is_error: false,
         content: vec![CallToolResultContent::Text { text }],
