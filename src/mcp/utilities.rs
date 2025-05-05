@@ -85,6 +85,8 @@ pub fn get_bearer_token() -> Option<String> {
 pub fn write_bearer_token(bearer_token: String) {
     let loc = get_bearer_token_location();
     std::fs::create_dir_all(loc.parent().unwrap()).unwrap();
-    std::fs::File::create(&loc).unwrap();
+    if !loc.exists() {
+        std::fs::File::create(&loc).unwrap();
+    }
     std::fs::write(loc, bearer_token.as_bytes()).unwrap();
 }
