@@ -1,7 +1,7 @@
 use crate::mcp::types::*;
 use crate::mcp::utilities;
 use maplit::hashmap;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use rpc_router::{Handler, HandlerResult, IntoHandlerError, RouterBuilder, RpcParams};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -183,6 +183,10 @@ pub async fn pay_mutinynet_invoice(req: PayInvoiceRequest) -> HandlerResult<Call
 
     let status = resp.status();
     if !status.is_success() {
+        if status == StatusCode::from_u16(401).unwrap() {
+            return login(LoginRequest {}).await;
+        }
+
         let text = resp.text().await.map_err(|_| {
             json!({"code": -32603, "message": "Error decoding text"}).into_handler_error()
         })?;
