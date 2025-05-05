@@ -13,6 +13,7 @@ pub fn register_tools(router_builder: RouterBuilder) -> RouterBuilder {
         .append_dyn("tools/list", tools_list.into_dyn())
         .append_dyn("login", login.into_dyn())
         .append_dyn("pay_mutinynet_invoice", pay_mutinynet_invoice.into_dyn())
+        .append_dyn("pay_mutinynet_address", pay_mutinynet_address.into_dyn())
 }
 
 pub async fn tools_list(_request: Option<ListToolsRequest>) -> HandlerResult<ListToolsResult> {
@@ -43,8 +44,28 @@ pub async fn tools_list(_request: Option<ListToolsRequest>) -> HandlerResult<Lis
             required: vec!["invoice".to_string()],
         },
     };
+    let pay_mutinynet_address = Tool {
+        name: "pay_mutinynet_address".to_string(),
+        description: Some("Pays the given mutinynet address".to_string()),
+        input_schema: ToolInputSchema {
+            type_name: "object".to_string(),
+            properties: hashmap! {
+                "address".to_string() => ToolInputSchemaProperty {
+                    type_name: Some("string".to_owned()),
+                    description: Some("Mutinynet address to pay".to_owned()),
+                    enum_values: None,
+                },
+                "amount".to_string() => ToolInputSchemaProperty {
+                    type_name: Some("number".to_owned()),
+                    description: Some("The amount in satoshis to pay the address, if none is given 5k sats will be used".to_owned()),
+                    enum_values: None,
+                },
+            },
+            required: vec!["address".to_string()],
+        },
+    };
     let response = ListToolsResult {
-        tools: vec![login, pay_mutinynet_invoice],
+        tools: vec![login, pay_mutinynet_invoice, pay_mutinynet_address],
         next_cursor: None,
     };
     Ok(response)
@@ -157,12 +178,7 @@ pub async fn pay_mutinynet_invoice(req: PayInvoiceRequest) -> HandlerResult<Call
     let token = match utilities::get_bearer_token() {
         Some(token) => token,
         None => {
-            return Ok(CallToolResult {
-                is_error: true,
-                content: vec![CallToolResultContent::Text {
-                    text: "You need to login first!".to_string(),
-                }],
-            });
+            return login(LoginRequest {}).await;
         }
     };
 
@@ -202,6 +218,77 @@ pub async fn pay_mutinynet_invoice(req: PayInvoiceRequest) -> HandlerResult<Call
     })?;
 
     let text = format!("Payment success! Preimage: {}", res.payment_hash);
+    Ok(CallToolResult {
+        is_error: false,
+        content: vec![CallToolResultContent::Text { text }],
+    })
+}
+
+#[derive(Deserialize, Serialize, RpcParams)]
+pub struct PayAddressRequest {
+    address: String,
+    amount: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct OnChainResponse {
+    pub txid: String,
+}
+
+pub async fn pay_mutinynet_address(req: PayAddressRequest) -> HandlerResult<CallToolResult> {
+    let token = match utilities::get_bearer_token() {
+        Some(token) => token,
+        None => {
+            return login(LoginRequest {}).await;
+        }
+    };
+    let amount = req.amount.unwrap_or(5_000);
+
+    if amount > 1_000_00 {
+        let text = "Amount is too high, max send amount is 1,000,000 sats".to_string();
+        return Ok(CallToolResult {
+            is_error: true,
+            content: vec![CallToolResultContent::Text { text }],
+        });
+    }
+
+    let client = Client::new();
+
+    let resp = client
+        .post("https://faucet.mutinynet.com/api/onchain")
+        .json(&json!({
+            "sats": amount,
+            "address": req.address,
+        }))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|_| {
+            json!({"code": -32603, "message": "Error making request"}).into_handler_error()
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        if status == StatusCode::from_u16(401).unwrap() {
+            return login(LoginRequest {}).await;
+        }
+
+        let text = resp.text().await.map_err(|_| {
+            json!({"code": -32603, "message": "Error decoding text"}).into_handler_error()
+        })?;
+
+        return Err(
+            json!({"code": -32603, "message": format!("Error ({status}): {text}")})
+                .into_handler_error(),
+        );
+    }
+
+    let res: OnChainResponse = resp.json().await.map_err(|_| {
+        json!({"code": -32603, "message": "Error decoding response"}).into_handler_error()
+    })?;
+
+    let text = format!("Payment success! Transaction id: {}", res.txid);
     Ok(CallToolResult {
         is_error: false,
         content: vec![CallToolResultContent::Text { text }],
